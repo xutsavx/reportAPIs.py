@@ -55,12 +55,50 @@ INCLUDE (acname);
 
 ## Endpoints
 
+See [PERFORMANCE_COMPARISON.md](PERFORMANCE_COMPARISON.md) for measured
+latency, response sizes, resource tradeoffs, and benchmark recommendations.
+
 - `GET /tree` — full tree
 - `GET /tree/{acid}` — subtree rooted at `acid`
 - `GET /children/{acid}` — one level of children only (for lazy-loading
   UIs — avoids sending the whole 100k+ node tree to the browser)
+- `POST /report-data` — execute a parameterized query or stored procedure
+  and return its columns dynamically
+- `GET /trialBalanceReport` — aggregate `rmd_trntran.a_acid`, `dramnt`, and
+  `cramnt`, then return one flat object per account. Totals are merged by
+  matching `a_acid` to `rmd_aclist.acid`; `acname` has four leading spaces per
+  tree level. This endpoint always reads both tables and builds the tree in
+  real time; it does not use the tree cache.
+- `GET /trialBalanceReportFromSP?fiscalyear=...` — execute
+  `dbo.py_trialbalance_api_test` with the fiscal year argument and return its
+  result rows unchanged. Tree construction and report calculations are done
+  inside the stored procedure.
 - `POST /refresh` — force an immediate rebuild
 - `GET /health` — row count + last build time
+
+### Dynamic report request body
+
+The `/report-data` endpoint accepts this shape:
+
+```json
+{
+  "source_type": "query",
+  "source": "SELECT acid, debit, credit FROM dbo.trial_balance WHERE tran_date BETWEEN ? AND ?",
+  "parameters": {"from_date": "2026-01-01", "to_date": "2026-01-31"}
+}
+```
+
+`parameters` values are sent to SQL Server in JSON insertion order. For a
+stored procedure, use `source_type: "procedure"` and a schema-qualified
+procedure name.
+
+The trial-balance response is a JSON array. Each object contains `acid`,
+`acname`, `debit`, `credit`, `balance`, `depth`, and `has_children`. Parent
+totals include all descendant accounts.
+
+The application logs the time for fetching account data, creating the account
+tree, fetching balance data, merging/flattening the report, and the total
+request duration.
 
 ## Keeping data fresh
 

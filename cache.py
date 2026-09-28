@@ -46,6 +46,10 @@ class TreeCache:
         with self._lock:
             return self._tree_json
 
+    def get_full_tree(self) -> list:
+        with self._lock:
+            return orjson.loads(self._tree_json)
+
     def get_subtree_bytes(self, acid: str) -> Optional[bytes]:
         with self._lock:
             node = self._nodes_by_id.get(acid)
