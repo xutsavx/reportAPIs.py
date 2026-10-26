@@ -1,67 +1,107 @@
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
+from datetime import datetime
 from decimal import Decimal
+from typing import Any, Dict
 
 import orjson
-from typing import Any, Dict, Literal
-
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 from brotli_asgi import BrotliMiddleware
-from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ConfigDict, Field
 
-from cache import tree_cache
+load_dotenv()
+
+from cache import account_cache
 from database import (
-    execute_report_source_with_timings,
-    fetch_all_rows,
+    fetch_branch_transfer_rows,
+    fetch_division_rows,
+    fetch_report_metadata,
+    fetch_stock_rows,
+    fetch_subledger_rows,
     fetch_trial_balance_rows,
 )
-from report_builder import build_trial_balance, flatten_trial_balance
-from tree_builder import build_tree
+from report_builder import (
+    build_consolidated_trial_balance_report,
+    build_trial_balance_report,
+)
+from tree_builder import build_account_tree_rows
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("trial_balance_api")
 
-# How often to rebuild in the background. Tune to how often the
-# underlying data actually changes - or set very high and rely on
-# POST /refresh triggered from wherever writes happen.
-# REFRESH_INTERVAL_SECONDS = 300
-
-
-# async def periodic_refresh():
-#     while True:
-#         await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
-#         try:
-#             await asyncio.to_thread(tree_cache.rebuild)
-#         except Exception:
-#             logging.exception("Background tree refresh failed")
-
-
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     # Build once at startup so the first request is already fast.
-#     await asyncio.to_thread(tree_cache.rebuild)
-#     task = asyncio.create_task(periodic_refresh())
-#     yield
-#     task.cancel()
-
-
-app = FastAPI(title="rmd_aclist tree API")
+app = FastAPI(title="Trial Balance Report API")
 app.add_middleware(BrotliMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this for production
-    allow_methods=["*"],
+    allow_origins=["*"],
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
 
 
-class ReportSourceRequest(BaseModel):
-    source_type: Literal["query", "procedure"]
-    source: str = Field(min_length=1)
-    parameters: Dict[str, Any] = Field(default_factory=dict)
+class SqlParameterModel(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
+class TrialBalanceParameters(SqlParameterModel):
+    date1: datetime = Field(alias="DATE1")
+    date2: datetime = Field(alias="DATE2")
+    division: str = Field(default="%", alias="DIV", max_length=3)
+    company_id: str = Field(default="%", alias="CID", max_length=50)
+    cost_center: str = Field(default="%", alias="COSTCENTER", max_length=50)
+    fiscal_year: str = Field(default="%", alias="PHISCALID", max_length=25)
+    ledger_wise: int = Field(default=0, alias="LEDGERWISE", ge=0, le=255)
+    summary_report: int = Field(default=0, alias="SUMMARYREPORT", ge=0, le=255)
+    levels: int = Field(default=2, alias="LEVELS")
+    show_opening_trial_only: int = Field(
+        default=0, alias="SHOWOPENINGTRIALONLY", ge=0, le=255
+    )
+    show_subledger: int = Field(default=0, alias="SHOWSUBLEDGER", ge=0, le=255)
+    show_debtors_creditors_details: int = Field(
+        default=0, alias="SHOWDEBTORSCREDITORSDETAILS", ge=0, le=255
+    )
+    show_stock_value: int = Field(default=0, alias="SHOWSTOCKVALUE", ge=0, le=255)
+    show_closing_on_previous_year: int = Field(
+        default=0, alias="SHOWCLOSINGONPY", ge=0, le=255
+    )
+    show_zero_balance: int = Field(default=0, alias="SHOWZEROBL", ge=0, le=255)
+    show_net_closing: int = Field(default=1, alias="SHOWNETCLOSING", ge=0, le=1)
+    node_account_id: str = Field(default="AL", alias="NODEACID", max_length=25)
+    node_account_name: str = Field(default="ACCOUNT", alias="NODEACNAME", max_length=100)
+
+
+class ConsolidatedTrialBalanceParameters(SqlParameterModel):
+    date1: datetime = Field(alias="DATE1")
+    date2: datetime = Field(alias="DATE2")
+    division: str = Field(default="%", alias="DIV", max_length=3)
+    company_id: str = Field(default="%", alias="CID", max_length=50)
+    cost_center: str = Field(default="%", alias="COSTCENTER", max_length=50)
+    fiscal_year: str = Field(default="%", alias="PHISCALID", max_length=25)
+    show_opening_trial_only: int = Field(
+        default=0, alias="SHOWOPENINGTRIALONLY", ge=0, le=255
+    )
+    show_subledger: int = Field(default=0, alias="SHOWSUBLEDGER", ge=0, le=255)
+    show_debtors_creditors_details: int = Field(
+        default=0, alias="SHOWDEBTORSCREDITORSDETAILS", ge=0, le=255
+    )
+    show_stock_value: int = Field(default=0, alias="SHOWSTOCKVALUE", ge=0, le=255)
+    ledger_wise: int = Field(default=0, alias="LEDGERWISE", ge=0, le=255)
+    show_net_closing: int = Field(default=1, alias="SHOWNETCLOSING", ge=0, le=1)
+
+
+class TrialBalanceTreeParameters(SqlParameterModel):
+    fiscal_year: str = Field(default="%", alias="PHISCALID", max_length=25)
+    node_account_id: str = Field(default="AL", alias="NODEACID", max_length=200)
+    node_account_name: str = Field(default="ACCOUNT", alias="NODEACNAME", max_length=1000)
+    group_only: int = Field(default=0, alias="GROUPONLY", ge=0, le=255)
+    show_debtors_creditors: int = Field(
+        default=0, alias="SHOWDEBTORSCREDITORSDETAILS", ge=0, le=255
+    )
+    show_subledger: int = Field(default=0, alias="SHOWSUBLEDGER", ge=0, le=255)
+    is_for_party_account: int = Field(default=0, alias="ISFORPARTYAC", ge=0, le=255)
 
 
 def _json_default(value: Any) -> Any:
@@ -70,146 +110,154 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Type {type(value).__name__} is not JSON serializable")
 
 
-# @app.get("/tree")
-# async def get_tree():
-#     """Full tree. Served as pre-serialized bytes - no build or
-#     validation cost per request."""
-#     return Response(content=tree_cache.get_full_tree_bytes(), media_type="application/json")
+def _build_account_tree(
+    parameters: Dict[str, Any], metadata: Dict[str, Any]
+) -> list[Dict[str, Any]]:
+    show_subledger = bool(
+        parameters["SHOWSUBLEDGER"] and metadata["settings"].get("enablesubledger")
+    )
+    account_rows = account_cache.get_account_rows()
+    subledger_rows = (
+        fetch_subledger_rows(parameters["PHISCALID"]) if show_subledger else []
+    )
+    accounts_by_id = {str(row["acid"]): row for row in account_rows}
+    for row in subledger_rows:
+        account = accounts_by_id.get(str(row["a_acid"]))
+        if account is not None:
+            row.update(
+                acname=account.get("acname"),
+                accode=account.get("accode"),
+                hassubledger=account.get("hassubledger"),
+            )
+    return build_account_tree_rows(
+        account_rows,
+        subledger_rows,
+        root_acid=parameters["NODEACID"],
+        root_name=parameters["NODEACNAME"],
+        show_debtors_creditors=bool(parameters["SHOWDEBTORSCREDITORSDETAILS"]),
+        show_subledger=show_subledger,
+        is_for_party_account=bool(parameters["ISFORPARTYAC"]),
+        account_config=metadata["accounts"],
+        group_only=bool(parameters["GROUPONLY"]),
+    )
 
 
-# @app.post("/report-data")
-# async def get_report_data(request: ReportSourceRequest):
-#     """Run a parameterized query or stored procedure and preserve its column shape."""
-#     try:
-#         return await asyncio.to_thread(
-#             execute_report_source, request.source_type, request.source, request.parameters
-#         )
-#     except Exception as exc:
-#         logging.exception("Report data source failed")
-#         raise HTTPException(400, str(exc)) from exc
+async def _report_response(parameters: TrialBalanceParameters) -> Response:
+    started = time.perf_counter()
+    try:
+        values = parameters.model_dump(by_alias=True)
+        metadata = await asyncio.to_thread(fetch_report_metadata, values["PHISCALID"])
+        tree_parameters = {
+            "PHISCALID": values["PHISCALID"],
+            "NODEACID": values["NODEACID"],
+            "NODEACNAME": values["NODEACNAME"],
+            "GROUPONLY": 0,
+            "SHOWDEBTORSCREDITORSDETAILS": values["SHOWDEBTORSCREDITORSDETAILS"],
+            "SHOWSUBLEDGER": values["SHOWSUBLEDGER"],
+            "ISFORPARTYAC": 0,
+        }
+        tree_rows = await asyncio.to_thread(_build_account_tree, tree_parameters, metadata)
+        transactions = await asyncio.to_thread(fetch_trial_balance_rows, values)
+        settings = metadata["settings"]
+        branch_rows = []
+        if not settings.get("enablesinglebatchmode"):
+            branch_rows = await asyncio.to_thread(fetch_branch_transfer_rows, values)
+        stock_rows = await asyncio.to_thread(
+            fetch_stock_rows, values["PHISCALID"], values["DATE2"]
+        )
+        rows = await asyncio.to_thread(
+            build_trial_balance_report,
+            tree_rows,
+            transactions,
+            values,
+            metadata,
+            branch_rows,
+            stock_rows,
+        )
+        body = orjson.dumps(rows, default=_json_default)
+        logger.info(
+            "Python trial balance returned %d rows (%d bytes); API total %.3fs",
+            len(rows),
+            len(body),
+            time.perf_counter() - started,
+        )
+        return Response(content=body, media_type="application/json")
+    except Exception as exc:
+        logger.exception("Python trial balance calculation failed")
+        raise HTTPException(status_code=500, detail="Trial balance report failed") from exc
 
 
 @app.get("/trialBalanceReport")
-async def trial_balance_report(fiscalyear: str):
-    """Fetch the account tree and balances in real time, then return flat rows."""
-    request_started = time.perf_counter()
+async def trial_balance_report(parameters: TrialBalanceParameters = Depends()):
+    """Fetch raw rows and calculate the trial balance in Python."""
+    return await _report_response(parameters)
+
+
+@app.get("/consolidatedTrialBalanceReport")
+async def consolidated_trial_balance_report(
+    parameters: ConsolidatedTrialBalanceParameters = Depends(),
+):
+    """Calculate and pivot consolidated closing balances in Python."""
+    started = time.perf_counter()
     try:
-        tree_fetch_started = time.perf_counter()
-        account_rows = await asyncio.to_thread(fetch_all_rows)
-        tree_fetch_seconds = time.perf_counter() - tree_fetch_started
-        logging.info(
-            "Trial balance: fetched tree data in %.3f seconds (%d accounts)",
-            tree_fetch_seconds,
-            len(account_rows),
+        values = parameters.model_dump(by_alias=True)
+        values["DIV"] = "%"
+        metadata = await asyncio.to_thread(fetch_report_metadata, values["PHISCALID"])
+        tree_parameters = {
+            "PHISCALID": values["PHISCALID"],
+            "NODEACID": "AL",
+            "NODEACNAME": "ACCOUNT",
+            "GROUPONLY": 0,
+            "SHOWDEBTORSCREDITORSDETAILS": values["SHOWDEBTORSCREDITORSDETAILS"],
+            "SHOWSUBLEDGER": values["SHOWSUBLEDGER"],
+            "ISFORPARTYAC": 0,
+        }
+        tree_rows = await asyncio.to_thread(_build_account_tree, tree_parameters, metadata)
+        transactions = await asyncio.to_thread(fetch_trial_balance_rows, values)
+        branch_rows = []
+        if not metadata["settings"].get("enablesinglebatchmode"):
+            branch_rows = await asyncio.to_thread(fetch_branch_transfer_rows, values)
+        stock_rows = await asyncio.to_thread(
+            fetch_stock_rows, values["PHISCALID"], values["DATE2"]
         )
-
-        tree_build_started = time.perf_counter()
-        tree, _nodes = await asyncio.to_thread(build_tree, account_rows)
-        tree_build_seconds = time.perf_counter() - tree_build_started
-        logging.info(
-            "Trial balance: created account tree in %.3f seconds", tree_build_seconds
+        divisions = await asyncio.to_thread(fetch_division_rows)
+        rows = await asyncio.to_thread(
+            build_consolidated_trial_balance_report,
+            tree_rows,
+            transactions,
+            values,
+            metadata,
+            divisions,
+            branch_rows,
+            stock_rows,
         )
-
-        balance_fetch_started = time.perf_counter()
-        rows = await asyncio.to_thread(fetch_trial_balance_rows, fiscalyear)
-        balance_fetch_seconds = time.perf_counter() - balance_fetch_started
-        logging.info(
-            "Trial balance: fetched balance data in %.3f seconds (%d accounts)",
-            balance_fetch_seconds,
+        body = orjson.dumps(rows, default=_json_default)
+        logger.info(
+            "Python consolidated trial balance returned %d rows (%d bytes); API total %.3fs",
             len(rows),
+            len(body),
+            time.perf_counter() - started,
         )
-
-        merge_started = time.perf_counter()
-        rolled_up_tree = await asyncio.to_thread(
-            build_trial_balance, tree, rows, "a_acid", "dramnt", "cramnt"
-        )
-        report_rows = await asyncio.to_thread(flatten_trial_balance, rolled_up_tree)
-        merge_seconds = time.perf_counter() - merge_started
-        serialization_started = time.perf_counter()
-        response_body = orjson.dumps(report_rows, default=_json_default)
-        response = Response(content=response_body, media_type="application/json")
-        serialization_seconds = time.perf_counter() - serialization_started
-        total_seconds = time.perf_counter() - request_started
-        logging.info(
-            "Trial balance: merged data in %.3f seconds, serialized %d rows (%d bytes) in %.3f seconds; total request %.3f seconds",
-            merge_seconds,
-            len(report_rows),
-            len(response_body),
-            serialization_seconds,
-            total_seconds,
-        )
-        return response
+        return Response(content=body, media_type="application/json")
     except Exception as exc:
-        logging.exception("Trial balance report failed")
-        raise HTTPException(400, str(exc)) from exc
+        logger.exception("Python consolidated trial balance calculation failed")
+        raise HTTPException(status_code=500, detail="Consolidated trial balance report failed") from exc
 
 
-@app.get("/trialBalanceReportFromSP")
-async def trial_balance_report_from_sp(fiscalyear: str):
-    """Return the trial-balance rows produced by the stored procedure."""
-    procedure_started = time.perf_counter()
+@app.get("/trialBalanceTree")
+async def trial_balance_tree(parameters: TrialBalanceTreeParameters = Depends()):
+    """Build the Python-expanded account tree from the cached account list."""
+    values = parameters.model_dump(by_alias=True)
     try:
-        rows, db_timings = await asyncio.to_thread(
-            execute_report_source_with_timings,
-            "procedure",
-            "dbo.py_trialbalance_api_test",
-            {"fiscalyear": fiscalyear},
-        )
-        logging.info(
-            "Trial balance SP: rows=%d, ODBC client timings seconds: connect=%.3f execute_wait=%.3f result_set=%.3f fetch_transfer=%.3f row_mapping=%.3f close=%.3f db_client_total=%.3f",
-            len(rows),
-            db_timings["connect_seconds"],
-            db_timings["execute_seconds"],
-            db_timings["result_set_seconds"],
-            db_timings["fetch_seconds"],
-            db_timings["mapping_seconds"],
-            db_timings["close_seconds"],
-            db_timings["client_total_seconds"],
-        )
-        serialization_started = time.perf_counter()
-        response_body = orjson.dumps(rows, default=_json_default)
-        response = Response(content=response_body, media_type="application/json")
-        serialization_seconds = time.perf_counter() - serialization_started
-        logging.info(
-            "Trial balance SP: serialized %d rows (%d bytes) in %.3f seconds; API processing before response=%.3f seconds",
-            len(rows),
-            len(response.body),
-            serialization_seconds,
-            time.perf_counter() - procedure_started,
-        )
-        return response
+        metadata = await asyncio.to_thread(fetch_report_metadata, values["PHISCALID"])
+        rows = await asyncio.to_thread(_build_account_tree, values, metadata)
+        body = orjson.dumps(rows, default=_json_default)
+        return Response(content=body, media_type="application/json")
     except Exception as exc:
-        logging.exception("Trial balance SP report failed")
-        raise HTTPException(400, str(exc)) from exc
-
-
-# @app.get("/tree/{acid}")
-# async def get_subtree(acid: str):
-#     """Just the subtree rooted at acid, including all descendants."""
-#     data = tree_cache.get_subtree_bytes(acid)
-#     if data is None:
-#         raise HTTPException(404, f"acid {acid} not found")
-#     return Response(content=data, media_type="application/json")
-
-
-# @app.get("/children/{acid}")
-# async def get_children(acid: str):
-#     """One level of children only - for expandable/lazy-loading UI
-#     trees that don't want the whole payload at once."""
-#     data = tree_cache.get_children_bytes(acid)
-#     if data is None:
-#         raise HTTPException(404, f"acid {acid} not found")
-#     return Response(content=data, media_type="application/json")
-
-
-# @app.post("/refresh")
-# async def refresh():
-#     """Force an immediate rebuild - call this from a trigger/webhook
-#     right after writes to rmd_aclist if you need fresher-than-5-minute data."""
-#     elapsed = await asyncio.to_thread(tree_cache.rebuild)
-#     return {"status": "ok", "seconds": round(elapsed, 3), **tree_cache.stats()}
+        logger.exception("Python account tree expansion failed")
+        raise HTTPException(status_code=500, detail="Account tree could not be loaded") from exc
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", **tree_cache.stats()}
+    return {"status": "ok", **account_cache.stats()}

@@ -1,133 +1,72 @@
-# rmd_aclist Tree API
+# Trial Balance Report API
 
-Fetches a self-referencing table (`acid` PK, `acname`, `parent`) from SQL
-Server and serves it as a nested JSON tree, built for large data (100k+
-rows, 10+ levels).
-
-## How it's fast
-
-1. **One flat SELECT**, not a recursive CTE — `database.py` pulls the
-   whole table in a single indexed scan.
-2. **O(n) tree build**, not recursive — `tree_builder.py` links parent →
-   child in two linear passes, so depth never matters.
-3. **Pre-serialized cache** — `cache.py` runs `orjson.dumps()` once per
-   rebuild and caches the raw bytes. Every request just returns that
-   buffer: no rebuild, no re-serialization, no Pydantic validation of a
-   huge nested structure, on the request path.
-4. **Background refresh** instead of rebuilding per request, plus a
-   manual `/refresh` you can call after writes.
+The API performs report calculations and account-tree expansion in Python.
+SQL Server is used only for parameterized `SELECT` queries that fetch source
+rows and configuration. No stored procedure or SQL function is called.
 
 ## Setup
 
-```bash
+Install dependencies and the SQL Server ODBC driver (Driver 17 or 18):
+
+```powershell
 pip install -r requirements.txt
-```
-
-Install the SQL Server ODBC driver (Driver 17 or 18) if you don't have
-it already, then set env vars (or edit the defaults in `database.py`):
-
-```bash
-export DB_SERVER=your-server
-export DB_DATABASE=your-db
-export DB_USER=your-user       # omit for Windows/trusted auth
-export DB_PASSWORD=your-pass
-```
-
-Run:
-
-```bash
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-## Recommended index
+Set database and Redis credentials in the local `.env` file before starting
+the API. It is excluded from Git. See `.env.example` for the available
+settings. The application loads `.env` automatically.
 
-Even though the tree build is a single flat scan, add an index on
-`parent` — it helps this query and any other query that filters/joins
-on it:
+Redis stores the complete account list used to build report trees. The list is
+loaded from SQL Server on a cache miss and reused to build each request's tree;
+tree results are not cached. Each request compares SQL Server's Change
+Tracking version with the version stored alongside the cached account rows.
+Changes to `dbo.RMD_ACLIST` or `dbo.AccountOrder` cause the rows to be
+reloaded and the next tree rebuilt. Redis entries also expire after 60 seconds
+without a report request. The `TREE_CACHE_IDLE_SECONDS` and
+`TREE_CACHE_KEY_PREFIX` settings are optional.
+Redis must be reachable at `REDIS_URL` (default `redis://localhost:6379/0`).
+HTTP responses of at least 1,000 bytes are compressed with Brotli when the
+client advertises `Accept-Encoding: br`. Redis cache values are uncompressed
+JSON bytes.
+
+Before running the API, a DBA must enable SQL Server Change Tracking for the
+database and both account source tables, and grant the application SQL login
+`VIEW CHANGE TRACKING` on each table:
 
 ```sql
-CREATE NONCLUSTERED INDEX IX_rmd_aclist_parent
-ON dbo.rmd_aclist (parent)
-INCLUDE (acname);
-```
+ALTER DATABASE [YourDatabase]
+SET CHANGE_TRACKING = ON (CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON);
 
-`acid` should already be indexed as the PK/clustered index.
+ALTER TABLE dbo.RMD_ACLIST
+ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = OFF);
+ALTER TABLE dbo.AccountOrder
+ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = OFF);
+
+GRANT VIEW CHANGE TRACKING ON dbo.RMD_ACLIST TO [YourAppUser];
+GRANT VIEW CHANGE TRACKING ON dbo.AccountOrder TO [YourAppUser];
+```
 
 ## Endpoints
 
-See [PERFORMANCE_COMPARISON.md](PERFORMANCE_COMPARISON.md) for measured
-latency, response sizes, resource tradeoffs, and benchmark recommendations.
+- `GET /trialBalanceReport` calculates opening, running, and closing balances
+  in Python. `DATE1` and `DATE2` are required; query parameters retain the
+  SQL report names and defaults: `DIV`, `CID`, `COSTCENTER`, `PHISCALID`,
+  `LEDGERWISE`, `SUMMARYREPORT`, `LEVELS`, `SHOWOPENINGTRIALONLY`,
+  `SHOWSUBLEDGER`, `SHOWDEBTORSCREDITORSDETAILS`, `SHOWSTOCKVALUE`,
+  `SHOWCLOSINGONPY`, `SHOWZEROBL`, `SHOWNETCLOSING`, `NODEACID`, and
+  `NODEACNAME`.
+- `GET /consolidatedTrialBalanceReport` calculates and pivots closing
+  balances across divisions in Python. It accepts `DATE1`, `DATE2`, `DIV`,
+  `CID`, `COSTCENTER`, `PHISCALID`, `SHOWOPENINGTRIALONLY`, `SHOWSUBLEDGER`,
+  `SHOWDEBTORSCREDITORSDETAILS`, `SHOWSTOCKVALUE`, `LEDGERWISE`, and
+  `SHOWNETCLOSING`.
+- `GET /trialBalanceTree` builds a Python-expanded tree from the cached
+  account list. It accepts `PHISCALID`, `NODEACID`, `NODEACNAME`, `GROUPONLY`,
+  `SHOWDEBTORSCREDITORSDETAILS`, `SHOWSUBLEDGER`, and `ISFORPARTYAC`.
+- `GET /health` reports API and cache backend status.
 
-- `GET /tree` — full tree
-- `GET /tree/{acid}` — subtree rooted at `acid`
-- `GET /children/{acid}` — one level of children only (for lazy-loading
-  UIs — avoids sending the whole 100k+ node tree to the browser)
-- `POST /report-data` — execute a parameterized query or stored procedure
-  and return its columns dynamically
-- `GET /trialBalanceReport` — aggregate `rmd_trntran.a_acid`, `dramnt`, and
-  `cramnt`, then return one flat object per account. Totals are merged by
-  matching `a_acid` to `rmd_aclist.acid`; `acname` has four leading spaces per
-  tree level. This endpoint always reads both tables and builds the tree in
-  real time; it does not use the tree cache.
-- `GET /trialBalanceReportFromSP?fiscalyear=...` — execute
-  `dbo.py_trialbalance_api_test` with the fiscal year argument and return its
-  result rows unchanged. Tree construction and report calculations are done
-  inside the stored procedure.
-- `POST /refresh` — force an immediate rebuild
-- `GET /health` — row count + last build time
-
-### Dynamic report request body
-
-The `/report-data` endpoint accepts this shape:
-
-```json
-{
-  "source_type": "query",
-  "source": "SELECT acid, debit, credit FROM dbo.trial_balance WHERE tran_date BETWEEN ? AND ?",
-  "parameters": {"from_date": "2026-01-01", "to_date": "2026-01-31"}
-}
-```
-
-`parameters` values are sent to SQL Server in JSON insertion order. For a
-stored procedure, use `source_type: "procedure"` and a schema-qualified
-procedure name.
-
-The trial-balance response is a JSON array. Each object contains `acid`,
-`acname`, `debit`, `credit`, `balance`, `depth`, and `has_children`. Parent
-totals include all descendant accounts.
-
-The application logs the time for fetching account data, creating the account
-tree, fetching balance data, merging/flattening the report, and the total
-request duration.
-
-## Keeping data fresh
-
-Two options, not mutually exclusive:
-
-- **Timer**: `REFRESH_INTERVAL_SECONDS` in `main.py` (default 5 min).
-- **On-demand**: call `POST /refresh` from wherever writes to
-  `rmd_aclist` happen (a trigger, an application event, a cron job).
-
-## Scaling beyond one process
-
-This cache lives in the memory of a single Python process. That's
-intentional — it's what makes serving instant. Implications:
-
-- **Single `uvicorn` worker is usually fine.** Once the cache is
-  built, serving a request is just "return cached bytes" — extremely
-  cheap, so one async worker can handle very high concurrency.
-- **If you do run multiple workers/instances** (e.g. behind a load
-  balancer), each one rebuilds its own copy independently — they won't
-  be perfectly in sync, and you're duplicating the build work. If that
-  matters, move the cached bytes into Redis: rebuild in one place,
-  `SET` the JSON bytes, and have every worker `GET` and return them
-  directly. Everything else in this design stays the same.
-
-## Payload size note
-
-At 100k+ rows, `GET /tree` can be a large response. `GZipMiddleware`
-is already enabled to shrink it over the wire. If the frontend renders
-an expandable tree UI, prefer `/children/{acid}` for lazy loading
-instead of pulling the whole tree at once — the backend is fast either
-way, but a multi-MB JSON payload is still a lot for a browser to parse
-in one go.
+The Python stock valuation follows the checked-in newer division-wise FIFO
+rules, including perishable-item layers and the latest non-zero rate fallback.
+Report results and account trees are recalculated for each request; only the
+complete account list is cached. Manual cache invalidation remains disabled.

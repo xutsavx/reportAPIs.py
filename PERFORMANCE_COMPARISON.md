@@ -1,5 +1,9 @@
 # Trial Balance API Performance Comparison
 
+> Historical measurements for the previous implementation. The API now
+> calculates reports in Python from direct `SELECT` results; the endpoint
+> comparisons below no longer describe the current code.
+
 ## Executive Summary
 
 For the single local test performed on 2026-09-28 with `fiscalyear=82/83`, the stored-procedure endpoint was faster end to end:

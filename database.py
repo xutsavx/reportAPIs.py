@@ -8,16 +8,15 @@ than pulling the whole table flat in one shot and linking it in Python
 round trips.
 """
 import os
-import re
-import time
-from typing import Any, Dict, List, Tuple, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 import pyodbc
 
-DB_SERVER = os.getenv("DB_SERVER", "103.90.86.144,55451")
-DB_DATABASE = os.getenv("DB_DATABASE", "SALT_HO_UAT")
-DB_USER = os.getenv("DB_USER", "ims")          # leave blank to use Windows/trusted auth
-DB_PASSWORD = os.getenv("DB_PASSWORD", "Uis02mQazbdgteyu")
+DB_SERVER = os.getenv("DB_SERVER", "")
+DB_DATABASE = os.getenv("DB_DATABASE", "")
+DB_USER = os.getenv("DB_USER", "")          # leave blank to use Windows/trusted auth
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_DRIVER = os.getenv("DB_DRIVER", "{ODBC Driver 18 for SQL Server}")
 DB_TRUST_CERT = os.getenv("DB_TRUST_SERVER_CERTIFICATE", "yes")
 
@@ -30,119 +29,228 @@ def get_connection_string() -> str:
     )
 
 
-def fetch_all_rows() -> List[Tuple[str, str, Optional[str]]]:
-    """
-    One flat, indexed SELECT for the whole table. Runs only at startup
-    and on periodic/manual refresh - never on a per-request path.
-    """
+def _fetch_dicts(cursor) -> List[Dict[str, Any]]:
+    columns = [column[0].lower() for column in cursor.description or []]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def fetch_account_rows() -> List[Dict[str, Any]]:
+    """Fetch account hierarchy fields for in-process tree construction."""
     conn = pyodbc.connect(get_connection_string())
     try:
         cursor = conn.cursor()
-        # NOLOCK avoids read-blocking on a hot table; drop it if you need
-        # strict consistency and occasional dirty reads aren't acceptable.
         cursor.execute(
             """
-            SELECT acid, acname, parent
-            FROM dbo.rmd_aclist WITH (NOLOCK)
+            SELECT A.ACID, A.TYPE, A.ACCODE, A.ACNAME, A.PARENT,
+                   ISNULL(A.MCAT, '') AS MCAT,
+                   ISNULL(A.HASSUBLEDGER, 0) AS HASSUBLEDGER,
+                   A.PTYPE, ISNULL(O.ORD, 1000) AS ACCOUNT_ORDER
+            FROM dbo.RMD_ACLIST A WITH (NOLOCK)
+            LEFT JOIN dbo.AccountOrder O WITH (NOLOCK) ON O.ACID = A.ACID
             """
         )
-        return [(r[0], r[1], r[2]) for r in cursor.fetchall()]
+        return _fetch_dicts(cursor)
     finally:
         conn.close()
 
 
-def fetch_trial_balance_rows(fiscalyear: str) -> List[Dict[str, Any]]:
-    """Aggregate transaction debits and credits by account id."""
+def fetch_account_data_version() -> int:
+    """Return the SQL Server change-tracking version for account source tables."""
     conn = pyodbc.connect(get_connection_string())
     try:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT a_acid, SUM(ISNULL(dramnt, 0)) AS dramnt,
-                   SUM(ISNULL(cramnt, 0)) AS cramnt
-            FROM dbo.rmd_trntran WITH (NOLOCK)
-            where phiscalid = ?
-            GROUP BY a_acid
-            having SUM(ISNULL(dramnt, 0)) + SUM(ISNULL(cramnt, 0)) <> 0;
+            SELECT CHANGE_TRACKING_CURRENT_VERSION() AS CURRENT_VERSION,
+                   CHANGE_TRACKING_MIN_VALID_VERSION(
+                       OBJECT_ID(N'dbo.RMD_ACLIST')
+                   ) AS ACCOUNT_MIN_VERSION,
+                   CHANGE_TRACKING_MIN_VALID_VERSION(
+                       OBJECT_ID(N'dbo.AccountOrder')
+                   ) AS ORDER_MIN_VERSION
+            """
+        )
+        row = cursor.fetchone()
+        if row is None or any(value is None for value in row):
+            raise RuntimeError(
+                "SQL Server Change Tracking must be enabled for the database "
+                "and dbo.RMD_ACLIST and dbo.AccountOrder; grant VIEW CHANGE "
+                "TRACKING to the application login."
+            )
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+def fetch_subledger_rows(fiscalyear: str) -> List[Dict[str, Any]]:
+    """Fetch subledger links used to construct synthetic account-tree nodes."""
+    conn = pyodbc.connect(get_connection_string())
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT DISTINCT T.A_ACID, ISNULL(T.SL_ACID, '') AS SL_ACID,
+                   S.SL_ACNAME
+            FROM dbo.RMD_TRNTRAN T WITH (NOLOCK)
+            LEFT JOIN dbo.RMD_SUBLEDGER_ACLIST S WITH (NOLOCK)
+                ON S.SL_ACID = T.SL_ACID
+            WHERE T.PHISCALID = ?
             """,
-            (fiscalyear,)
+            fiscalyear,
         )
-        return [
-            {"a_acid": row[0], "dramnt": row[1], "cramnt": row[2]}
-            for row in cursor.fetchall()
-        ]
+        return _fetch_dicts(cursor)
     finally:
         conn.close()
 
 
-def execute_report_source(
-    source_type: str,
-    source: str,
-    parameters: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """Execute a report source and return rows by column name."""
-    rows, _timings = execute_report_source_with_timings(source_type, source, parameters)
-    return rows
-
-
-def execute_report_source_with_timings(
-    source_type: str,
-    source: str,
-    parameters: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
-    """Execute a report source and time client-observable ODBC stages."""
-    if source_type not in {"query", "procedure"}:
-        raise ValueError("source_type must be 'query' or 'procedure'")
-    if not source.strip():
-        raise ValueError("source cannot be empty")
-    if source_type == "procedure" and not re.fullmatch(r"[\w.\[\]]+", source):
-        raise ValueError("procedure must be a SQL identifier, optionally schema-qualified")
-
-    total_started = time.perf_counter()
-    timings = {
-        "connect_seconds": 0.0,
-        "execute_seconds": 0.0,
-        "result_set_seconds": 0.0,
-        "fetch_seconds": 0.0,
-        "mapping_seconds": 0.0,
-        "close_seconds": 0.0,
-        "client_total_seconds": 0.0,
-    }
-    connect_started = time.perf_counter()
+def fetch_trial_balance_rows(parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fetch raw ledger rows; all report grouping and calculations stay in Python."""
     conn = pyodbc.connect(get_connection_string())
-    timings["connect_seconds"] = time.perf_counter() - connect_started
     try:
-        # SQL Server UDT columns (ODBC type -151) are returned as bytes so
-        # stored-procedure results remain fetchable and JSON serializable.
-        conn.add_output_converter(-151, lambda value: None if value is None else bytes(value).hex())
         cursor = conn.cursor()
-        values = list(parameters.values())
-        execute_started = time.perf_counter()
-        if source_type == "procedure":
-            placeholders = ", ".join("?" for _ in values)
-            cursor.execute(f"EXEC {source} {placeholders}" if values else f"EXEC {source}", *values)
-        else:
-            cursor.execute(source, *values)
-        timings["execute_seconds"] = time.perf_counter() - execute_started
-
-        result_set_started = time.perf_counter()
-        while cursor.description is None:
-            if not cursor.nextset():
-                timings["result_set_seconds"] = time.perf_counter() - result_set_started
-                return [], timings
-        timings["result_set_seconds"] = time.perf_counter() - result_set_started
-
-        columns = [column[0] for column in cursor.description]
-        fetch_started = time.perf_counter()
-        fetched_rows = cursor.fetchall()
-        timings["fetch_seconds"] = time.perf_counter() - fetch_started
-
-        mapping_started = time.perf_counter()
-        rows = [dict(zip(columns, row)) for row in fetched_rows]
-        timings["mapping_seconds"] = time.perf_counter() - mapping_started
-        return rows, timings
+        cursor.execute(
+            """
+            SELECT T.A_ACID, T.DRAMNT, T.CRAMNT, ISNULL(T.SL_ACID, '') AS SL_ACID,
+                   T.DIVISION, T.COMPANYID, T.PHISCALID, T.COSTCENTER,
+                   M.TRNDATE, M.VOUCHERTYPE, A.TYPE, A.PTYPE, A.HASSUBLEDGER
+            FROM dbo.RMD_TRNTRAN T WITH (NOLOCK)
+            INNER JOIN dbo.RMD_ACLIST A WITH (NOLOCK)
+                ON A.ACID = T.A_ACID AND A.TYPE = 'A'
+            INNER JOIN dbo.RMD_TRNMAIN M WITH (NOLOCK) ON M.VCHRNO = T.VCHRNO
+            WHERE M.TRNDATE <= ? AND M.PHISCALID = ?
+              AND (? = '%' OR T.DIVISION = ?)
+              AND (? = '%' OR T.COSTCENTER = ?)
+            """,
+            parameters["DATE2"],
+            parameters["PHISCALID"],
+            parameters["DIV"],
+            parameters["DIV"],
+            parameters["COSTCENTER"],
+            parameters["COSTCENTER"],
+        )
+        return _fetch_dicts(cursor)
     finally:
-        close_started = time.perf_counter()
         conn.close()
-        timings["close_seconds"] = time.perf_counter() - close_started
-        timings["client_total_seconds"] = time.perf_counter() - total_started
+
+
+def fetch_report_metadata(fiscal_year: str) -> Dict[str, Any]:
+    """Fetch configuration and fiscal-year values needed by Python calculations."""
+    conn = pyodbc.connect(get_connection_string())
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT ISNULL(ENABLESUBLEDGER, 0) AS ENABLESUBLEDGER,
+                   ISNULL(ENABLESINGLEBATCHMODE, 0) AS ENABLESINGLEBATCHMODE,
+                   ISNULL(ENABLEITEMWISECOSTCENTER, 0) AS ENABLEITEMWISECOSTCENTER,
+                   ISNULL(ENABLEBATCH, 0) AS ENABLEBATCH,
+                   ISNULL(EnableAcBaseBranchTransfer, 1) AS ENABLEACBASEBRANCHTRANSFER,
+                   ISNULL(EnableBranchWiseTfrInOutAC, 0) AS ENABLEBRANCHWISETFRINOUTAC,
+                   ISNULL(EnableLateACPosting_TransferOut, 0) AS ENABLELATEACPOSTING_TRANSFEROUT
+            FROM dbo.SETTING WITH (NOLOCK)
+            """
+        )
+        settings = _fetch_dicts(cursor)
+        cursor.execute(
+            "SELECT BEGINDATE FROM dbo.PHISCALYEAR WITH (NOLOCK) WHERE PHISCALID = ?",
+            fiscal_year,
+        )
+        fiscal_rows = _fetch_dicts(cursor)
+        cursor.execute(
+            "SELECT PARTICULARS, TRNAC FROM dbo.RMD_TAXCHARGES_CONFIG WITH (NOLOCK)"
+        )
+        configs = _fetch_dicts(cursor)
+        return {
+            "settings": settings[0] if settings else {},
+            "begin_date": fiscal_rows[0]["begindate"] if fiscal_rows else None,
+            "accounts": {str(row["particulars"]).upper(): row["trnac"] for row in configs},
+        }
+    finally:
+        conn.close()
+
+
+def fetch_branch_transfer_rows(parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fetch raw branch-transfer inventory movements for Python accounting."""
+    conn = pyodbc.connect(get_connection_string())
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT M.VCHRNO, M.REFBILL, M.BILLTO, M.BILLTOADD, M.VOUCHERTYPE,
+                   M.TRNDATE, M.PHISCALID, M.DIVISION, M.COSTCENTER,
+                   P.MCODE, P.BATCH, P.QUANTITY, P.RATE, P.REALQTY_IN, P.REALQTY,
+                   I.PTYPE, BPM.LANDINGCOST, D.ACID AS DESTINATION_ACID,
+                   D.TRANSFERINAC, D.TRANSFEROUTAC,
+                   TI.TRNAC AS CONFIG_TRANSFERINAC,
+                   TI.DEFAULT_TRNAC AS DEFAULT_TRANSFERINAC,
+                   TOC.TRNAC AS CONFIG_TRANSFEROUTAC,
+                   TOC.DEFAULT_TRNAC AS DEFAULT_TRANSFEROUTAC
+            FROM dbo.INVMAIN M WITH (NOLOCK)
+            INNER JOIN dbo.INVPROD P WITH (NOLOCK) ON P.VCHRNO = M.VCHRNO
+            INNER JOIN dbo.MENUITEM I WITH (NOLOCK) ON I.MCODE = P.MCODE
+            LEFT JOIN dbo.BATCHPRICE_MASTER BPM WITH (NOLOCK)
+                ON BPM.MCODE = P.MCODE AND BPM.BATCHCODE = P.BATCH
+            LEFT JOIN dbo.DIVISION D WITH (NOLOCK)
+                ON D.INITIAL = CASE WHEN M.VOUCHERTYPE = 'TO' THEN M.BILLTOADD ELSE M.BILLTO END
+            LEFT JOIN dbo.RMD_TAXCHARGES_CONFIG TI WITH (NOLOCK)
+                ON TI.PARTICULARS = 'BRANCHTRANSFERIN'
+            LEFT JOIN dbo.RMD_TAXCHARGES_CONFIG TOC WITH (NOLOCK)
+                ON TOC.PARTICULARS = 'BRANCHTRANSFEROUT'
+            WHERE M.TRNDATE BETWEEN ? AND ? AND M.PHISCALID = ?
+              AND M.VOUCHERTYPE IN ('TR', 'TO')
+              AND (? = '%' OR ISNULL(CONVERT(VARCHAR, M.COSTCENTER), '') = ?)
+            """,
+            parameters["DATE1"],
+            parameters["DATE2"],
+            parameters["PHISCALID"],
+            parameters["COSTCENTER"],
+            parameters["COSTCENTER"],
+        )
+        return _fetch_dicts(cursor)
+    finally:
+        conn.close()
+
+
+def fetch_stock_rows(fiscal_year: str, through_date: datetime) -> List[Dict[str, Any]]:
+    """Fetch raw inventory movements and rates for Python stock valuation."""
+    conn = pyodbc.connect(get_connection_string())
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT M.VCHRNO, M.TRNDATE, M.TRNTIME, M.PHISCALID, M.VOUCHERTYPE,
+                   M.DIVISION, P.DIVISION AS PRODUCTDIVISION, M.COSTCENTER,
+                   P.MCODE, P.BATCH, P.NBATCHID,
+                   P.WAREHOUSE, P.REALQTY_IN, P.REALQTY, P.REALRATE, P.RATE,
+                   P.CRATE, P.PRATE, I.PTYPE, I.TYPE AS ITEMTYPE, I.ITEMCOSTCENTER,
+                   I.CRATE AS ITEMCRATE, I.PRATE_A, D.COSTCENTER AS DIVISIONCOSTCENTER,
+                   W.ISVIRTUAL, W.ISADJUSTMENT, W.DIVISION AS WAREHOUSEDIVISION,
+                   BPM.LANDINGCOST
+            FROM dbo.RMD_TRNMAIN M WITH (NOLOCK)
+            INNER JOIN dbo.RMD_TRNPROD P WITH (NOLOCK) ON P.VCHRNO = M.VCHRNO
+            INNER JOIN dbo.MENUITEM I WITH (NOLOCK) ON I.MCODE = P.MCODE
+            INNER JOIN dbo.RMD_WAREHOUSE W WITH (NOLOCK) ON W.NAME = P.WAREHOUSE
+            INNER JOIN dbo.DIVISION D WITH (NOLOCK) ON D.INITIAL = M.DIVISION
+            LEFT JOIN dbo.vwBatchPriceMaster BPM WITH (NOLOCK)
+                ON BPM.MCODE = P.MCODE AND BPM.BATCHCODE = P.BATCH
+               AND ISNULL(BPM.ID, '') = ISNULL(P.NBATCHID, '')
+            WHERE M.PHISCALID = ? AND M.TRNDATE <= ?
+              AND I.TYPE = 'A' AND I.PTYPE < 10
+            """,
+            fiscal_year,
+            through_date,
+        )
+        return _fetch_dicts(cursor)
+    finally:
+        conn.close()
+
+
+def fetch_division_rows() -> List[Dict[str, Any]]:
+    """Fetch division identifiers and display names for the consolidated report."""
+    conn = pyodbc.connect(get_connection_string())
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT INITIAL, NAME FROM dbo.DIVISION WITH (NOLOCK)")
+        return _fetch_dicts(cursor)
+    finally:
+        conn.close()
