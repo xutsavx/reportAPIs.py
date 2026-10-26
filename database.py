@@ -54,34 +54,6 @@ def fetch_account_rows() -> List[Dict[str, Any]]:
         conn.close()
 
 
-def fetch_account_data_version() -> int:
-    """Return the SQL Server change-tracking version for account source tables."""
-    conn = pyodbc.connect(get_connection_string())
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT CHANGE_TRACKING_CURRENT_VERSION() AS CURRENT_VERSION,
-                   CHANGE_TRACKING_MIN_VALID_VERSION(
-                       OBJECT_ID(N'dbo.RMD_ACLIST')
-                   ) AS ACCOUNT_MIN_VERSION,
-                   CHANGE_TRACKING_MIN_VALID_VERSION(
-                       OBJECT_ID(N'dbo.AccountOrder')
-                   ) AS ORDER_MIN_VERSION
-            """
-        )
-        row = cursor.fetchone()
-        if row is None or any(value is None for value in row):
-            raise RuntimeError(
-                "SQL Server Change Tracking must be enabled for the database "
-                "and dbo.RMD_ACLIST and dbo.AccountOrder; grant VIEW CHANGE "
-                "TRACKING to the application login."
-            )
-        return int(row[0])
-    finally:
-        conn.close()
-
-
 def fetch_subledger_rows(fiscalyear: str) -> List[Dict[str, Any]]:
     """Fetch subledger links used to construct synthetic account-tree nodes."""
     conn = pyodbc.connect(get_connection_string())

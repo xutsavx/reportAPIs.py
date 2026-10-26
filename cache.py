@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 import orjson
 import redis
 
-from database import fetch_account_data_version, fetch_account_rows
+from database import fetch_account_rows
 
 logger = logging.getLogger("account_cache")
 CACHE_REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -44,45 +44,30 @@ class RedisAccountCache:
     def get_account_rows(self) -> List[Dict[str, Any]]:
         with self._lock:
             cached = self.client.get(self.key)
-            source_version = fetch_account_data_version()
             if cached is not None:
                 cached_value = orjson.loads(cached)
                 if (
                     isinstance(cached_value, dict)
-                    and cached_value.get("source_version") == source_version
                     and isinstance(cached_value.get("rows"), list)
                 ):
                     self.client.expire(self.key, self.idle_seconds)
                     logger.info(
-                        "RMD_ACLIST cache hit: source_version=%s",
-                        source_version,
+                        "RMD_ACLIST cache hit: rows=%d",
+                        len(cached_value["rows"]),
                     )
                     return cached_value["rows"]
 
-            for _ in range(3):
-                account_rows = fetch_account_rows()
-                refreshed_version = fetch_account_data_version()
-                if refreshed_version == source_version:
-                    payload = orjson.dumps(
-                        {
-                            "source_version": refreshed_version,
-                            "rows": account_rows,
-                        },
-                        default=_json_default,
-                    )
-                    self.client.setex(self.key, self.idle_seconds, payload)
-                    logger.info(
-                        "RMD_ACLIST cache refreshed: source_version=%s rows=%d",
-                        refreshed_version,
-                        len(account_rows),
-                    )
-                    return account_rows
-                source_version = refreshed_version
-
-            raise RuntimeError(
-                "Account source tables changed repeatedly while refreshing "
-                "the RMD_ACLIST cache."
+            account_rows = fetch_account_rows()
+            payload = orjson.dumps(
+                {"rows": account_rows},
+                default=_json_default,
             )
+            self.client.setex(self.key, self.idle_seconds, payload)
+            logger.info(
+                "RMD_ACLIST cache refreshed: rows=%d",
+                len(account_rows),
+            )
+            return account_rows
 
     def stats(self) -> Dict[str, Any]:
         return {

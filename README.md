@@ -19,33 +19,15 @@ settings. The application loads `.env` automatically.
 
 Redis stores the complete account list used to build report trees. The list is
 loaded from SQL Server on a cache miss and reused to build each request's tree;
-tree results are not cached. Each request compares SQL Server's Change
-Tracking version with the version stored alongside the cached account rows.
-Changes to `dbo.RMD_ACLIST` or `dbo.AccountOrder` cause the rows to be
-reloaded and the next tree rebuilt. Redis entries also expire after 60 seconds
-without a report request. The `TREE_CACHE_IDLE_SECONDS` and
+tree results are not cached. Account rows are reloaded after the Redis entry
+expires, which occurs after 60 seconds without a report request by default.
+Changes to `dbo.RMD_ACLIST` or `dbo.AccountOrder` appear after that expiration
+and the next cache miss. The `TREE_CACHE_IDLE_SECONDS` and
 `TREE_CACHE_KEY_PREFIX` settings are optional.
 Redis must be reachable at `REDIS_URL` (default `redis://localhost:6379/0`).
 HTTP responses of at least 1,000 bytes are compressed with Brotli when the
 client advertises `Accept-Encoding: br`. Redis cache values are uncompressed
 JSON bytes.
-
-Before running the API, a DBA must enable SQL Server Change Tracking for the
-database and both account source tables, and grant the application SQL login
-`VIEW CHANGE TRACKING` on each table:
-
-```sql
-ALTER DATABASE [YourDatabase]
-SET CHANGE_TRACKING = ON (CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON);
-
-ALTER TABLE dbo.RMD_ACLIST
-ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = OFF);
-ALTER TABLE dbo.AccountOrder
-ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = OFF);
-
-GRANT VIEW CHANGE TRACKING ON dbo.RMD_ACLIST TO [YourAppUser];
-GRANT VIEW CHANGE TRACKING ON dbo.AccountOrder TO [YourAppUser];
-```
 
 ## Endpoints
 
